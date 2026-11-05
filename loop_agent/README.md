@@ -9,6 +9,7 @@
 ```text
 loop_agent/
 ├── __init__.py      # 패키지 공개 API 익스포트
+├── agent.py         # [ADK UI/Server] adk web / adk run / adk api_server용 root_agent 엔트리포인트
 ├── runtime.py       # [Layer 1] 순수 Google ADK LoopAgent 런타임 (harness2 import 0개)
 ├── bridge.py        # [Layer 2] 비침투적 harness2 브리지 (ADK_SURFACE, AdkSubstrate, AdkBenchmarkAdapter)
 ├── cli.py           # [CLI] demo 및 benchmark sweep 실행 엔트리포인트
@@ -116,6 +117,8 @@ cp .env.example .env
 | `HARNESS2_ADK_MODEL` (또는 `ADK_MODEL`) | `gemini-2.5-pro` | `LoopAgent`가 사용할 모델 ID (예: `gemini-2.5-pro`, `gemini-2.5-flash`, 오프라인 테스트용 `local/deterministic`) |
 | `HARNESS2_ADK_MAX_ITERATIONS` (또는 `ADK_MAX_ITERATIONS`) | `3` | `LoopAgent`의 최대 `solver` → `verifier` 반복 횟수 |
 | `HARNESS2_ADK_COMMAND_TIMEOUT` (또는 `ADK_COMMAND_TIMEOUT`) | `120` | `run_bash` 도구 1회 실행당 타임아웃(초) |
+| `HARNESS2_ADK_HARNESS_DIR` (또는 `ADK_HARNESS_DIR`) | `runs/adk_interactive/harness` | 대화형 실행(`adk web`/`adk run`/`adk api_server`) 시 로드할 하네스 디렉터리 경로 |
+| `HARNESS2_ADK_WORKSPACE` (또는 `ADK_WORKSPACE`) | `runs/adk_interactive/workspace` | 대화형 실행 시 에이전트 도구가 파일을 읽고 쓰는 작업 디렉터리 경로 |
 | `GOOGLE_GENAI_USE_VERTEXAI` | `""` | Vertex AI 사용 시 `TRUE`로 설정 (`GOOGLE_CLOUD_PROJECT`만 설정되고 API 키가 없을 경우 자동으로 `TRUE` 설정) |
 | `GOOGLE_CLOUD_PROJECT` | `""` | Google Cloud / Vertex AI 프로젝트 ID |
 | `GOOGLE_CLOUD_LOCATION` | `global` | Vertex AI 리전 |
@@ -189,7 +192,65 @@ cp .env.example .env
   --env-file .env
 ```
 
-### 4.5 Python API로 사용하기
+### 4.5 대화형 웹 UI / 터미널 채팅 / REST API 서버로 호출하기 (`adk web`, `adk run`, `adk api_server`)
+
+`loop_agent/agent.py`가 Google ADK 표준 `root_agent`(`LoopAgent`)를 노출하므로, `google-adk` 내장 CLI로 즉시 웹 채팅 UI, 터미널 대화형 채팅, 또는 FastAPI REST 서버를 기동해 호출할 수 있습니다.
+
+#### 사전 준비 (`.env` 설정)
+특정 하네스 디렉터리(`harness2`가 적응시킨 하네스 등)와 작업 디렉터리를 연결하고 싶다면 `.env`에 아래 항목을 설정합니다(미지정 시 `runs/adk_interactive/harness` 및 `runs/adk_interactive/workspace`가 자동 생성됩니다).
+
+```ini
+GOOGLE_API_KEY=your-gemini-api-key
+HARNESS2_ADK_MODEL=gemini-2.5-pro
+HARNESS2_ADK_HARNESS_DIR=runs/demo_adk/library/k1/accounting/harness
+HARNESS2_ADK_WORKSPACE=runs/adk_interactive/workspace
+```
+
+#### 1) 브라우저 웹 UI에서 대화형 채팅 (`adk web`)
+브라우저에서 채팅하면서 `LoopAgent` 내부의 **`solver` → `verifier` 루프 전환, 도구 호출(`load_skill`, `run_bash`, `read_file`, `write_file`, `exit_loop`), `.adk/hooks.json` 훅 결과**를 실시간 이벤트 그래프로 확인할 수 있습니다.
+
+```bash
+.venv/bin/adk web loop_agent --port 8000
+# 기동 후 브라우저에서 http://127.0.0.1:8000 접속
+```
+
+#### 2) 터미널(CLI)에서 대화형 채팅 (`adk run`)
+별도 브라우저 없이 터미널에서 대화형으로 프롬프트를 주고받으며 실행할 때 사용합니다.
+
+```bash
+.venv/bin/adk run loop_agent
+```
+
+#### 3) 외부 UI / 애플리케이션에서 HTTP REST / SSE API로 호출 (`adk api_server`)
+자체 프론트엔드나 외부 서비스에서 HTTP API로 호출하려면 FastAPI 서버 모드로 기동합니다.
+
+```bash
+.venv/bin/adk api_server loop_agent --port 8000
+# Swagger UI 문서 확인: http://127.0.0.1:8000/docs
+```
+
+`adk api_server` 기동 후 `curl`로 세션을 생성하고 메시지를 호출하는 예시:
+
+```bash
+# 1) 사용자(u1) 세션(s1) 생성
+curl -X POST http://127.0.0.1:8000/apps/loop_agent/users/u1/sessions/s1 \
+  -H "Content-Type: application/json" -d '{}'
+
+# 2) 메시지 전송 및 LoopAgent 실행 (실시간 SSE 스트리밍은 /run 대신 /run_sse 사용)
+curl -X POST http://127.0.0.1:8000/run \
+  -H "Content-Type: application/json" \
+  -d '{
+    "appName": "loop_agent",
+    "userId": "u1",
+    "sessionId": "s1",
+    "newMessage": {
+      "role": "user",
+      "parts": [{"text": "workspace에 hello.txt를 작성하고 검증해줘."}]
+    }
+  }'
+```
+
+### 4.6 Python API로 사용하기
 
 ```python
 from pathlib import Path

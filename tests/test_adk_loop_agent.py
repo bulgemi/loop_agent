@@ -153,7 +153,7 @@ class _TwoIterationHookTestLlm(BaseLlm):
 
 class AdkLoopAgentTest(unittest.TestCase):
     def test_runtime_has_zero_harness2_dependency_and_upstream_is_unmodified(self) -> None:
-        for rel in ("loop_agent/__init__.py", "loop_agent/runtime.py"):
+        for rel in ("loop_agent/__init__.py", "loop_agent/runtime.py", "loop_agent/agent.py"):
             src = (REPO_ROOT / rel).read_text(encoding="utf-8")
             mod = ast.parse(src, filename=rel)
             imported: list[str] = []
@@ -423,6 +423,25 @@ class AdkLoopAgentTest(unittest.TestCase):
                 runner_env = AdkSubstrate().run_env()
                 self.assertEqual(runner_env.get("GOOGLE_API_KEY"), "test-adk-secret-key")
                 self.assertEqual(runner_env.get("GEMINI_API_KEY"), "test-adk-secret-key")
+
+    def test_adk_agent_loader_discovers_root_loop_agent(self) -> None:
+        from google.adk.cli.utils.agent_loader import AgentLoader
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch.dict(
+                os.environ,
+                {
+                    "HARNESS2_ADK_HARNESS_DIR": str(root / "harness"),
+                    "HARNESS2_ADK_WORKSPACE": str(root / "workspace"),
+                },
+            ):
+                loader = AgentLoader(str(REPO_ROOT / "loop_agent"))
+                agents = loader.list_agents()
+                self.assertEqual(agents, ["loop_agent"])
+                loaded = loader.load_agent("loop_agent")
+                self.assertIsInstance(loaded, LoopAgent)
+                self.assertEqual([a.name for a in loaded.sub_agents], ["solver", "verifier"])
 
 
 if __name__ == "__main__":
