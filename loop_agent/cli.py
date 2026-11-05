@@ -27,6 +27,7 @@ from harness2.core.proposer import Proposer
 from harness2.demo import DemoAdapter, DemoProposer
 
 from .bridge import make_adk_adapter, wrap_adapter
+from .runtime import load_dotenv
 
 
 def _run_demo(args: argparse.Namespace) -> int:
@@ -102,6 +103,12 @@ def _run_sweep(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="loop_agent.cli", description=__doc__)
+    parser.add_argument(
+        "--env-file",
+        type=Path,
+        default=None,
+        help="Optional path to a .env file to load before running",
+    )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_demo = sub.add_parser("demo", help="Run the offline ADK LoopAgent adaptation demo")
@@ -124,6 +131,14 @@ def main(argv: list[str] | None = None) -> int:
     p_sweep.add_argument("--dry-run", action="store_true")
 
     args = parser.parse_args(argv)
+    if args.env_file is not None:
+        load_dotenv(args.env_file, override=True)
+        config_load = getattr(C.config, "load_dotenv", None)
+        if callable(config_load):
+            config_load(args.env_file)
+    else:
+        load_dotenv()
+
     if args.cmd == "demo":
         return _run_demo(args)
     return _run_sweep(args)

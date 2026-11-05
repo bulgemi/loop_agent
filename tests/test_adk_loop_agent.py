@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -35,11 +36,16 @@ from harness2.core import schedule
 from harness2.core import tree as HT
 from harness2.core.spec import BenchmarkAdapter, SubstrateLike
 from loop_agent import (
+    adk_command_timeout,
+    adk_max_iterations,
+    adk_model,
     build_loop_agent,
+    load_dotenv,
     make_workspace_tools,
     render_events,
     run_loop_rollout,
 )
+from loop_agent.runtime import scrub_runtime_env
 from loop_agent.bridge import (
     ADK_SURFACE,
     DEMO_STOP_HOOK,
@@ -162,7 +168,7 @@ class AdkLoopAgentTest(unittest.TestCase):
             )
 
         diff = subprocess.run(
-            ["git", "diff", "origin/main", "--", "harness2/", "pyproject.toml", ".env.example"],
+            ["git", "diff", "origin/main", "--", "harness2/", "pyproject.toml"],
             cwd=REPO_ROOT,
             capture_output=True,
             text=True,
@@ -359,6 +365,64 @@ class AdkLoopAgentTest(unittest.TestCase):
                     self.assertTrue((run_dir / "adk_events.jsonl").is_file())
                     traj = (run_dir / "trajectory.md").read_text(encoding="utf-8")
                     self.assertIn("[HARNESS] loop escalated by verifier", traj)
+
+
+    def test_dotenv_and_env_example_configuration(self) -> None:
+        example_path = REPO_ROOT / ".env.example"
+        self.assertTrue(example_path.is_file(), ".env.example must exist at repository root")
+        self.assertFalse((REPO_ROOT / ".env.sample").exists(), ".env.sample should not duplicate .env.example")
+
+        clean_env = {
+            k: v
+            for k, v in os.environ.items()
+            if k
+            not in {
+                "GOOGLE_API_KEY",
+                "GEMINI_API_KEY",
+                "ADK_API_KEY",
+                "HARNESS2_ADK_API_KEY",
+                "HARNESS2_ADK_MODEL",
+                "ADK_MODEL",
+                "HARNESS2_SOLVER_MODEL",
+                "HARNESS2_ADK_MAX_ITERATIONS",
+                "ADK_MAX_ITERATIONS",
+                "HARNESS2_ADK_COMMAND_TIMEOUT",
+                "ADK_COMMAND_TIMEOUT",
+                "GOOGLE_CLOUD_PROJECT",
+                "GOOGLE_GENAI_USE_VERTEXAI",
+            }
+        }
+        with patch.dict(os.environ, clean_env, clear=True):
+            loaded_example = load_dotenv(example_path, override=True)
+            self.assertIn("GOOGLE_API_KEY", loaded_example)
+            self.assertEqual(adk_model(), "gemini-2.5-pro")
+            self.assertEqual(adk_max_iterations(), 3)
+            self.assertEqual(adk_command_timeout(), 120)
+
+            with tempfile.TemporaryDirectory() as tmp:
+                custom_env = Path(tmp) / ".env"
+                custom_env.write_text(
+                    "ADK_API_KEY=test-adk-secret-key\n"
+                    "HARNESS2_ADK_MODEL=google/gemini-2.5-flash\n"
+                    "HARNESS2_ADK_MAX_ITERATIONS=5\n"
+                    "HARNESS2_ADK_COMMAND_TIMEOUT=45\n",
+                    encoding="utf-8",
+                )
+                load_dotenv(custom_env, override=True)
+                self.assertEqual(os.environ.get("GOOGLE_API_KEY"), "test-adk-secret-key")
+                self.assertEqual(os.environ.get("GEMINI_API_KEY"), "test-adk-secret-key")
+                self.assertEqual(adk_model(), "gemini-2.5-flash")
+                self.assertEqual(adk_max_iterations(), 5)
+                self.assertEqual(adk_command_timeout(), 45)
+
+                scrubbed = scrub_runtime_env()
+                self.assertNotIn("GOOGLE_API_KEY", scrubbed)
+                self.assertNotIn("GEMINI_API_KEY", scrubbed)
+                self.assertNotIn("ADK_API_KEY", scrubbed)
+
+                runner_env = AdkSubstrate().run_env()
+                self.assertEqual(runner_env.get("GOOGLE_API_KEY"), "test-adk-secret-key")
+                self.assertEqual(runner_env.get("GEMINI_API_KEY"), "test-adk-secret-key")
 
 
 if __name__ == "__main__":

@@ -22,8 +22,12 @@
 
 from .runtime import (
     ALWAYS_ON_FILES,
+    adk_command_timeout,
+    adk_max_iterations,
+    adk_model,
     build_loop_agent,
     compose_global_instruction,
+    load_dotenv,
     make_deterministic_loop_llm,
     make_tool_callbacks,
     make_workspace_tools,
@@ -35,8 +39,12 @@ from .runtime import (
 
 __all__ = [
     "ALWAYS_ON_FILES",
+    "adk_command_timeout",
+    "adk_max_iterations",
+    "adk_model",
     "build_loop_agent",
     "compose_global_instruction",
+    "load_dotenv",
     "make_deterministic_loop_llm",
     "make_tool_callbacks",
     "make_workspace_tools",

@@ -301,16 +301,22 @@ class AdkSubstrate:
     def run_env(
         self, base_env: Mapping[str, str] | None = None, *, model: str = ""
     ) -> dict[str, str]:
+        RT.load_dotenv()
         keep = (
             "GOOGLE_API_KEY",
             "GEMINI_API_KEY",
             "GOOGLE_GENERATIVE_AI_API_KEY",
+            "ADK_API_KEY",
+            "HARNESS2_ADK_API_KEY",
         ) + config.provider_keys(model or config.SOLVER_MODEL_OC)
         env = config.scrub_env(base_env, keep=keep)
-        if config.VERTEX_PROJECT:
-            env.setdefault("GOOGLE_CLOUD_PROJECT", config.VERTEX_PROJECT)
-            env.setdefault("GOOGLE_CLOUD_LOCATION", config.VERTEX_REGION)
-            env.setdefault("GOOGLE_GENAI_USE_VERTEXAI", "TRUE")
+        if config.VERTEX_PROJECT or os.environ.get("GOOGLE_CLOUD_PROJECT"):
+            proj = os.environ.get("GOOGLE_CLOUD_PROJECT") or config.VERTEX_PROJECT
+            loc = os.environ.get("GOOGLE_CLOUD_LOCATION") or config.VERTEX_REGION
+            env.setdefault("GOOGLE_CLOUD_PROJECT", proj)
+            env.setdefault("GOOGLE_CLOUD_LOCATION", loc)
+            if not env.get("GOOGLE_API_KEY") and not env.get("GEMINI_API_KEY"):
+                env.setdefault("GOOGLE_GENAI_USE_VERTEXAI", "TRUE")
         return env
 
     def execute(

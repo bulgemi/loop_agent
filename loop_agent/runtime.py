@@ -42,6 +42,8 @@ from collections.abc import AsyncGenerator, Callable, Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
+ROOT_DIR = Path(__file__).resolve().parents[1]
+
 ALWAYS_ON_FILES = (
     "systemprompt.md",
     "guardrails.md",
@@ -54,6 +56,8 @@ _SCRUB_KEYS = frozenset(
         "HARNESS2_JUDGE_API_KEY",
         "HARNESS2_BRIDGE_KEY",
         "HARNESS2_CODEX_API_KEY",
+        "HARNESS2_ADK_API_KEY",
+        "ADK_API_KEY",
         "ANTHROPIC_API_KEY",
         "ANTHROPIC_AUTH_TOKEN",
         "ANTHROPIC_BASE_URL",
@@ -96,8 +100,94 @@ DEFAULT_VERIFIER_STAGE_INSTRUCTION = (
 )
 
 
+def _sync_genai_env() -> None:
+    """Normalize API key and Vertex AI environment variables for `google-adk` / `google-genai`."""
+    api_key = (
+        os.environ.get("GOOGLE_API_KEY")
+        or os.environ.get("GEMINI_API_KEY")
+        or os.environ.get("ADK_API_KEY")
+        or os.environ.get("HARNESS2_ADK_API_KEY")
+        or os.environ.get("GOOGLE_GENERATIVE_AI_API_KEY")
+        or ""
+    ).strip()
+    if api_key:
+        if not os.environ.get("GOOGLE_API_KEY"):
+            os.environ["GOOGLE_API_KEY"] = api_key
+        if not os.environ.get("GEMINI_API_KEY"):
+            os.environ["GEMINI_API_KEY"] = api_key
+
+    vertex_project = (
+        os.environ.get("GOOGLE_CLOUD_PROJECT")
+        or os.environ.get("HARNESS2_VERTEX_PROJECT")
+        or ""
+    ).strip()
+    if vertex_project:
+        if not os.environ.get("GOOGLE_CLOUD_PROJECT"):
+            os.environ["GOOGLE_CLOUD_PROJECT"] = vertex_project
+        if not os.environ.get("GOOGLE_CLOUD_LOCATION"):
+            os.environ["GOOGLE_CLOUD_LOCATION"] = "global"
+        if not api_key and not os.environ.get("GOOGLE_GENAI_USE_VERTEXAI"):
+            os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = "TRUE"
+
+
+def load_dotenv(
+    path: Path | str | None = None, *, override: bool = False
+) -> dict[str, str]:
+    """Load `KEY=VALUE` settings (LLM API keys, ADK model, limits) from `.env` into `os.environ`.
+
+    Shell environment variables take precedence unless `override=True`.
+    """
+    candidates: list[Path] = []
+    if path is not None:
+        candidates.append(Path(path))
+    else:
+        env_file = os.environ.get("LOOP_AGENT_ENV_FILE", "").strip()
+        if env_file:
+            candidates.append(Path(env_file))
+        cwd_env = Path.cwd() / ".env"
+        root_env = ROOT_DIR / ".env"
+        candidates.append(cwd_env)
+        if root_env != cwd_env:
+            candidates.append(root_env)
+
+    loaded: dict[str, str] = {}
+    for candidate in candidates:
+        try:
+            text = candidate.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for raw in text.splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            if line.startswith("export "):
+                line = line[len("export ") :].lstrip()
+            key, _, value = line.partition("=")
+            key = key.strip()
+            if not key or not all(c.isalnum() or c == "_" for c in key):
+                continue
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+                value = value[1:-1]
+            elif " #" in value:
+                value = value.split(" #", 1)[0].rstrip()
+            loaded[key] = value
+            if override:
+                os.environ[key] = value
+            elif not os.environ.get(key) and (value or key not in os.environ):
+                os.environ[key] = value
+        break
+
+    _sync_genai_env()
+    return loaded
+
+
+load_dotenv()
+
+
 def adk_model(default: str = "gemini-2.5-pro") -> str:
-    """Resolve the ADK model name from environment variables without importing `harness2`."""
+    """Resolve the ADK model name from `.env` / environment variables without importing `harness2`."""
+    load_dotenv()
     raw = (
         os.environ.get("HARNESS2_ADK_MODEL")
         or os.environ.get("ADK_MODEL")
@@ -110,10 +200,24 @@ def adk_model(default: str = "gemini-2.5-pro") -> str:
 
 
 def adk_max_iterations(default: int = 3) -> int:
-    """Resolve the maximum LoopAgent iterations from environment variables."""
+    """Resolve the maximum LoopAgent iterations from `.env` / environment variables."""
+    load_dotenv()
     raw = (
         os.environ.get("HARNESS2_ADK_MAX_ITERATIONS")
         or os.environ.get("ADK_MAX_ITERATIONS")
+        or ""
+    ).strip()
+    if not raw:
+        return int(default)
+    return int(raw)
+
+
+def adk_command_timeout(default: int = 120) -> int:
+    """Resolve the per-command `run_bash` timeout in seconds from `.env` / environment variables."""
+    load_dotenv()
+    raw = (
+        os.environ.get("HARNESS2_ADK_COMMAND_TIMEOUT")
+        or os.environ.get("ADK_COMMAND_TIMEOUT")
         or ""
     ).strip()
     if not raw:
@@ -329,11 +433,14 @@ def sync_workspace_assets(staged: Path, workspace: Path) -> None:
 
 
 def make_workspace_tools(
-    staged: Path, workspace: Path, *, command_timeout: int = 120
+    staged: Path, workspace: Path, *, command_timeout: int | None = None
 ) -> dict[str, Callable[..., Any]]:
     """Build the Python functions exposed as ADK tools inside `LoopAgent` stages."""
     staged = Path(staged).resolve()
     workspace = Path(workspace).resolve()
+    effective_timeout = (
+        int(command_timeout) if command_timeout is not None else adk_command_timeout()
+    )
     sync_workspace_assets(staged, workspace)
 
     def _safe_ws_path(rel_or_abs: str) -> Path:
@@ -370,7 +477,7 @@ def make_workspace_tools(
                 env=scrub_runtime_env(),
                 capture_output=True,
                 text=True,
-                timeout=command_timeout,
+                timeout=effective_timeout,
             )
             return {
                 "status": "ok" if res.returncode == 0 else "error",
@@ -383,7 +490,7 @@ def make_workspace_tools(
                 "status": "error",
                 "exit_code": 124,
                 "stdout": exc.stdout or "",
-                "stderr": f"Command timed out after {command_timeout}s",
+                "stderr": f"Command timed out after {effective_timeout}s",
             }
         except OSError as exc:
             return {"status": "error", "exit_code": 1, "stdout": "", "stderr": str(exc)}
@@ -997,7 +1104,17 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--events-out", type=Path, required=True)
     p.add_argument("--model", default="")
     p.add_argument("--max-iterations", type=int, default=None)
+    p.add_argument(
+        "--env-file",
+        type=Path,
+        default=None,
+        help="Optional path to a .env file to load before running the LoopAgent",
+    )
     args = p.parse_args(argv)
+    if args.env_file is not None:
+        load_dotenv(args.env_file, override=True)
+    else:
+        load_dotenv()
 
     prompt = args.prompt_file.read_text(encoding="utf-8", errors="replace")
     try:
@@ -1019,11 +1136,14 @@ __all__ = [
     "ALWAYS_ON_FILES",
     "DEFAULT_SOLVER_STAGE_INSTRUCTION",
     "DEFAULT_VERIFIER_STAGE_INSTRUCTION",
+    "ROOT_DIR",
+    "adk_command_timeout",
     "adk_max_iterations",
     "adk_model",
     "build_loop_agent",
     "compose_global_instruction",
     "load_adk_classes",
+    "load_dotenv",
     "make_deterministic_loop_llm",
     "make_tool_callbacks",
     "make_workspace_tools",
