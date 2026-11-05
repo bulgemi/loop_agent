@@ -25,7 +25,13 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from .runtime import ALWAYS_ON_FILES, ROOT_DIR, build_loop_agent, load_dotenv
+from .runtime import (
+    ALWAYS_ON_FILES,
+    ROOT_DIR,
+    adk_isolate_sessions,
+    build_loop_agent,
+    load_dotenv,
+)
 
 load_dotenv()
 
@@ -65,10 +71,21 @@ def _resolve_interactive_dirs() -> tuple[Path, Path]:
     return harness_dir, workspace_dir
 
 
-def create_root_agent():
-    """Build the `LoopAgent` instance exposed as `root_agent` to the Google ADK CLI/Web server."""
+def create_root_agent(*, isolate_sessions: bool | None = None):
+    """Build the `LoopAgent` instance exposed as `root_agent` to the Google ADK CLI/Web server.
+
+    By default, `isolate_sessions=True` in interactive/server mode so each `(user_id, session_id)`
+    operates in its own `<workspace>/<user_id>/<session_id>/` directory without file collisions.
+    """
     harness_dir, workspace_dir = _resolve_interactive_dirs()
-    return build_loop_agent(harness_dir, workspace_dir)
+    effective_isolate = (
+        adk_isolate_sessions(default=True)
+        if isolate_sessions is None
+        else bool(isolate_sessions)
+    )
+    return build_loop_agent(
+        harness_dir, workspace_dir, isolate_sessions=effective_isolate
+    )
 
 
 root_agent = create_root_agent()

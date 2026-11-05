@@ -113,10 +113,13 @@ cp .env.example .env
 |---|---|---|
 | `GOOGLE_API_KEY` | `""` | Google AI Studio(Gemini) API 키 (`google-adk` 기본 인증 키) |
 | `GEMINI_API_KEY` | `""` | `GOOGLE_API_KEY`의 별칭 (설정 시 `GOOGLE_API_KEY`로 자동 매핑됨) |
-| `ADK_API_KEY` | `""` | ADK 전용 키 별칭 (설정 시 `GOOGLE_API_KEY` 및 `GEMINI_API_KEY`로 자동 매핑됨) |
-| `HARNESS2_ADK_MODEL` (또는 `ADK_MODEL`) | `gemini-2.5-pro` | `LoopAgent`가 사용할 모델 ID (예: `gemini-2.5-pro`, `gemini-2.5-flash`, 오프라인 테스트용 `local/deterministic`) |
+| `ADK_API_KEY` | `""` | ADK 전용 키 별칭 (설정 시 `GOOGLE_API_KEY`로 자동 매핑됨) |
+| `HARNESS2_ADK_MODEL` (또는 `ADK_MODEL`) | `gemini-3.1-pro-preview` | `LoopAgent`가 사용할 모델 ID (예: `gemini-3.1-pro-preview`, 오프라인 테스트용 `local/deterministic`) |
 | `HARNESS2_ADK_MAX_ITERATIONS` (또는 `ADK_MAX_ITERATIONS`) | `3` | `LoopAgent`의 최대 `solver` → `verifier` 반복 횟수 |
 | `HARNESS2_ADK_COMMAND_TIMEOUT` (또는 `ADK_COMMAND_TIMEOUT`) | `120` | `run_bash` 도구 1회 실행당 타임아웃(초) |
+| `HARNESS2_ADK_MAX_CONCURRENT_COMMANDS` (또는 `ADK_MAX_CONCURRENT_COMMANDS`) | `8` | 다중 사용자 환경에서 동시에 실행 가능한 최대 서브프로세스(`run_bash`/훅) 수(Semaphore) |
+| `HARNESS2_ADK_ISOLATE_SESSIONS` (또는 `ADK_ISOLATE_SESSIONS`) | `TRUE` *(대화형 서버)* / `FALSE` *(배치 롤아웃)* | 활성화 시 `tool_context`의 `user_id`/`session_id` 기준으로 `<workspace>/<user>/<session>/` 및 `.tmp`를 자동 분리 |
+| `HARNESS2_ADK_SESSION_SERVICE_URI` (또는 `ADK_SESSION_SERVICE_URI`) | `sqlite:///runs/adk_interactive/sessions.db` | `loop_agent.cli serve` 실행 시 사용할 영속 세션 DB URI (예: `postgresql+asyncpg://...`) |
 | `HARNESS2_ADK_HARNESS_DIR` (또는 `ADK_HARNESS_DIR`) | `runs/adk_interactive/harness` | 대화형 실행(`adk web`/`adk run`/`adk api_server`) 시 로드할 하네스 디렉터리 경로 |
 | `HARNESS2_ADK_WORKSPACE` (또는 `ADK_WORKSPACE`) | `runs/adk_interactive/workspace` | 대화형 실행 시 에이전트 도구가 파일을 읽고 쓰는 작업 디렉터리 경로 |
 | `GOOGLE_GENAI_USE_VERTEXAI` | `""` | Vertex AI 사용 시 `TRUE`로 설정 (`GOOGLE_CLOUD_PROJECT`만 설정되고 API 키가 없을 경우 자동으로 `TRUE` 설정) |
@@ -206,27 +209,33 @@ HARNESS2_ADK_HARNESS_DIR=runs/demo_adk/library/k1/accounting/harness
 HARNESS2_ADK_WORKSPACE=runs/adk_interactive/workspace
 ```
 
-#### 1) 브라우저 웹 UI에서 대화형 채팅 (`adk web`)
+#### 1) 다중 사용자 안전 모드로 서버 기동 (`loop_agent.cli serve` — 권장)
+세션별 워크스페이스 격리(`HARNESS2_ADK_ISOLATE_SESSIONS=TRUE`), 비동기(`async`) 논블로킹 도구 실행, 동시 서브프로세스 세마포어 제한, 그리고 영속 DB 세션 스토리지(`--session-service-uri`)를 한 번에 구성하여 기동합니다.
+
+```bash
+# 브라우저 Web UI 모드로 기동 (기본 SQLite 세션 DB 자동 연결)
+.venv/bin/python -m loop_agent.cli serve --web --port 8000
+
+# 외부 DB(PostgreSQL 등) 세션 스토리지를 연결해 다중 워커/컨테이너용 REST API 서버 기동
+.venv/bin/python -m loop_agent.cli serve \
+  --server-mode api_server \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --session-service-uri "postgresql+asyncpg://user:pass@localhost:5432/adk_sessions"
+```
+
+#### 2) `adk` CLI로 직접 기동 (`adk web`, `adk run`, `adk api_server`)
 브라우저에서 채팅하면서 `LoopAgent` 내부의 **`solver` → `verifier` 루프 전환, 도구 호출(`load_skill`, `run_bash`, `read_file`, `write_file`, `exit_loop`), `.adk/hooks.json` 훅 결과**를 실시간 이벤트 그래프로 확인할 수 있습니다.
 
 ```bash
+# 브라우저 Web UI 기동 (http://127.0.0.1:8000 접속)
 .venv/bin/adk web loop_agent --port 8000
-# 기동 후 브라우저에서 http://127.0.0.1:8000 접속
-```
 
-#### 2) 터미널(CLI)에서 대화형 채팅 (`adk run`)
-별도 브라우저 없이 터미널에서 대화형으로 프롬프트를 주고받으며 실행할 때 사용합니다.
-
-```bash
+# 터미널 대화형 CLI 채팅 기동
 .venv/bin/adk run loop_agent
-```
 
-#### 3) 외부 UI / 애플리케이션에서 HTTP REST / SSE API로 호출 (`adk api_server`)
-자체 프론트엔드나 외부 서비스에서 HTTP API로 호출하려면 FastAPI 서버 모드로 기동합니다.
-
-```bash
+# FastAPI REST/SSE 서버 기동 (Swagger UI: http://127.0.0.1:8000/docs)
 .venv/bin/adk api_server loop_agent --port 8000
-# Swagger UI 문서 확인: http://127.0.0.1:8000/docs
 ```
 
 `adk api_server` 기동 후 `curl`로 세션을 생성하고 메시지를 호출하는 예시:

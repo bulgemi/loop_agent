@@ -37,6 +37,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import warnings
 from collections.abc import AsyncGenerator, Callable, Iterable, Mapping
 from pathlib import Path
@@ -100,8 +101,46 @@ DEFAULT_VERIFIER_STAGE_INSTRUCTION = (
 )
 
 
-def _sync_genai_env() -> None:
+warnings.filterwarnings(
+    "ignore",
+    message=".*GOOGLE_GENAI_USE_VERTEXAI is deprecated.*",
+    category=DeprecationWarning,
+)
+
+_DEFAULT_DOTENV_LOADED = False
+
+
+def _sync_genai_env(
+    *, override: bool = False, loaded: Mapping[str, str] | None = None
+) -> None:
     """Normalize API key and Vertex AI environment variables for `google-adk` / `google-genai`."""
+    if os.environ.get("GOOGLE_GENAI_USE_VERTEXAI") == "":
+        os.environ.pop("GOOGLE_GENAI_USE_VERTEXAI", None)
+
+    if override and loaded is not None:
+        explicit_key = (
+            loaded.get("GOOGLE_API_KEY")
+            or loaded.get("GEMINI_API_KEY")
+            or loaded.get("ADK_API_KEY")
+            or loaded.get("HARNESS2_ADK_API_KEY")
+            or loaded.get("GOOGLE_GENERATIVE_AI_API_KEY")
+            or ""
+        ).strip()
+        if explicit_key:
+            os.environ["GOOGLE_API_KEY"] = explicit_key
+            os.environ.pop("GEMINI_API_KEY", None)
+        elif any(
+            k in loaded
+            for k in (
+                "GOOGLE_API_KEY",
+                "GEMINI_API_KEY",
+                "ADK_API_KEY",
+                "HARNESS2_ADK_API_KEY",
+            )
+        ):
+            os.environ["GOOGLE_API_KEY"] = ""
+            os.environ.pop("GEMINI_API_KEY", None)
+
     api_key = (
         os.environ.get("GOOGLE_API_KEY")
         or os.environ.get("GEMINI_API_KEY")
@@ -111,10 +150,9 @@ def _sync_genai_env() -> None:
         or ""
     ).strip()
     if api_key:
-        if not os.environ.get("GOOGLE_API_KEY"):
-            os.environ["GOOGLE_API_KEY"] = api_key
-        if not os.environ.get("GEMINI_API_KEY"):
-            os.environ["GEMINI_API_KEY"] = api_key
+        os.environ["GOOGLE_API_KEY"] = api_key
+        if "GEMINI_API_KEY" in os.environ:
+            os.environ.pop("GEMINI_API_KEY", None)
 
     vertex_project = (
         os.environ.get("GOOGLE_CLOUD_PROJECT")
@@ -137,6 +175,11 @@ def load_dotenv(
 
     Shell environment variables take precedence unless `override=True`.
     """
+    global _DEFAULT_DOTENV_LOADED
+    if path is None and not override and _DEFAULT_DOTENV_LOADED:
+        _sync_genai_env()
+        return {}
+
     candidates: list[Path] = []
     if path is not None:
         candidates.append(Path(path))
@@ -172,20 +215,26 @@ def load_dotenv(
             elif " #" in value:
                 value = value.split(" #", 1)[0].rstrip()
             loaded[key] = value
+            if key == "GOOGLE_GENAI_USE_VERTEXAI" and not value:
+                if override:
+                    os.environ.pop(key, None)
+                continue
             if override:
                 os.environ[key] = value
             elif not os.environ.get(key) and (value or key not in os.environ):
                 os.environ[key] = value
         break
 
-    _sync_genai_env()
+    if path is None and not override:
+        _DEFAULT_DOTENV_LOADED = True
+    _sync_genai_env(override=override, loaded=loaded)
     return loaded
 
 
 load_dotenv()
 
 
-def adk_model(default: str = "gemini-2.5-pro") -> str:
+def adk_model(default: str = "gemini-3.1-pro-preview") -> str:
     """Resolve the ADK model name from `.env` / environment variables without importing `harness2`."""
     load_dotenv()
     raw = (
@@ -225,13 +274,106 @@ def adk_command_timeout(default: int = 120) -> int:
     return int(raw)
 
 
+def adk_max_concurrent_commands(default: int = 8) -> int:
+    """Resolve the maximum number of concurrent `run_bash`/hook subprocesses across sessions."""
+    load_dotenv()
+    raw = (
+        os.environ.get("HARNESS2_ADK_MAX_CONCURRENT_COMMANDS")
+        or os.environ.get("ADK_MAX_CONCURRENT_COMMANDS")
+        or ""
+    ).strip()
+    if not raw:
+        return max(1, int(default))
+    return max(1, int(raw))
+
+
+def adk_isolate_sessions(default: bool = False) -> bool:
+    """Resolve whether per-user/per-session workspace isolation is enabled."""
+    load_dotenv()
+    raw = (
+        os.environ.get("HARNESS2_ADK_ISOLATE_SESSIONS")
+        or os.environ.get("ADK_ISOLATE_SESSIONS")
+        or ""
+    ).strip().lower()
+    if not raw:
+        return bool(default)
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    return bool(default)
+
+
+def adk_session_service_uri(default: str = "") -> str:
+    """Resolve the persistent ADK `session_service_uri` from `.env` / environment variables."""
+    load_dotenv()
+    return (
+        os.environ.get("HARNESS2_ADK_SESSION_SERVICE_URI")
+        or os.environ.get("ADK_SESSION_SERVICE_URI")
+        or default
+    ).strip()
+
+
+_SUBPROCESS_SEM_LOCK = threading.Lock()
+_SUBPROCESS_SEMAPHORES: dict[int, threading.BoundedSemaphore] = {}
+
+
+def _get_subprocess_semaphore(limit: int | None = None) -> threading.BoundedSemaphore:
+    cap = int(limit) if limit is not None else adk_max_concurrent_commands()
+    cap = max(1, cap)
+    with _SUBPROCESS_SEM_LOCK:
+        sem = _SUBPROCESS_SEMAPHORES.get(cap)
+        if sem is None:
+            sem = threading.BoundedSemaphore(cap)
+            _SUBPROCESS_SEMAPHORES[cap] = sem
+        return sem
+
+
+def resolve_session_workspace(
+    base_workspace: Path,
+    tool_context: Any = None,
+    *,
+    isolate_sessions: bool = False,
+) -> Path:
+    """Resolve the workspace directory for the current tool/callback invocation.
+
+    When `isolate_sessions=True` and `tool_context` provides `user_id`/`session.id`,
+    returns `<base_workspace>/<user_id>/<session_id>` so concurrent multi-user sessions
+    never collide on files or temporary directories.
+    """
+    base = Path(base_workspace).resolve()
+    if not isolate_sessions or tool_context is None:
+        return base
+    user_id = str(getattr(tool_context, "user_id", "") or "").strip()
+    session_obj = getattr(tool_context, "session", None)
+    session_id = str(getattr(session_obj, "id", "") or "").strip()
+    if not user_id and not session_id:
+        return base
+    safe_user = re.sub(r"[^a-zA-Z0-9_.-]", "_", user_id or "anonymous")
+    safe_session = re.sub(r"[^a-zA-Z0-9_.-]", "_", session_id or "default")
+    target = (base / safe_user / safe_session).resolve()
+    if target != base and base not in target.parents:
+        return base
+    return target
+
+
 def scrub_runtime_env(
-    base_env: Mapping[str, str] | None = None, *, keep: Iterable[str] = ()
+    base_env: Mapping[str, str] | None = None,
+    *,
+    keep: Iterable[str] = (),
+    workspace: Path | None = None,
 ) -> dict[str, str]:
-    """Return a copy of `base_env` with host/judge secrets removed."""
+    """Return a copy of `base_env` with host/judge secrets removed and optional per-session TMPDIR."""
     src = os.environ if base_env is None else base_env
     drop = _SCRUB_KEYS - set(keep)
-    return {k: v for k, v in src.items() if k not in drop}
+    env = {k: v for k, v in src.items() if k not in drop}
+    if workspace is not None:
+        tmp_dir = Path(workspace).resolve() / ".tmp"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        env["TMPDIR"] = str(tmp_dir)
+        env["TMP"] = str(tmp_dir)
+        env["TEMP"] = str(tmp_dir)
+    return env
 
 
 def _interp(text: str, ctx: Mapping[str, str] | None) -> str:
@@ -380,15 +522,16 @@ def run_hook_event(
             if not cmd:
                 continue
             try:
-                res = subprocess.run(
-                    ["bash", "-c", cmd],
-                    input=payload,
-                    cwd=workspace,
-                    env=scrub_runtime_env(),
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout,
-                )
+                with _get_subprocess_semaphore():
+                    res = subprocess.run(
+                        ["bash", "-c", cmd],
+                        input=payload,
+                        cwd=workspace,
+                        env=scrub_runtime_env(workspace=workspace),
+                        capture_output=True,
+                        text=True,
+                        timeout=timeout,
+                    )
             except (OSError, subprocess.TimeoutExpired) as exc:
                 outputs.append(f"hook error: {exc}")
                 continue
@@ -433,7 +576,11 @@ def sync_workspace_assets(staged: Path, workspace: Path) -> None:
 
 
 def make_workspace_tools(
-    staged: Path, workspace: Path, *, command_timeout: int | None = None
+    staged: Path,
+    workspace: Path,
+    *,
+    command_timeout: int | None = None,
+    isolate_sessions: bool | None = None,
 ) -> dict[str, Callable[..., Any]]:
     """Build the Python functions exposed as ADK tools inside `LoopAgent` stages."""
     staged = Path(staged).resolve()
@@ -441,16 +588,29 @@ def make_workspace_tools(
     effective_timeout = (
         int(command_timeout) if command_timeout is not None else adk_command_timeout()
     )
-    sync_workspace_assets(staged, workspace)
+    effective_isolate = (
+        bool(isolate_sessions)
+        if isolate_sessions is not None
+        else adk_isolate_sessions(default=False)
+    )
+    if not effective_isolate:
+        sync_workspace_assets(staged, workspace)
 
-    def _safe_ws_path(rel_or_abs: str) -> Path:
+    def _ws_for(tool_context: Any = None) -> Path:
+        ws = resolve_session_workspace(
+            workspace, tool_context, isolate_sessions=effective_isolate
+        )
+        sync_workspace_assets(staged, ws)
+        return ws
+
+    def _safe_ws_path(rel_or_abs: str, ws: Path) -> Path:
         p = Path(rel_or_abs)
-        target = p.resolve() if p.is_absolute() else (workspace / p).resolve()
-        if target != workspace and workspace not in target.parents:
-            raise ValueError(f"path {rel_or_abs!r} is outside workspace {workspace}")
+        target = p.resolve() if p.is_absolute() else (ws / p).resolve()
+        if target != ws and ws not in target.parents:
+            raise ValueError(f"path {rel_or_abs!r} is outside workspace {ws}")
         return target
 
-    def load_skill(name: str) -> dict[str, Any]:
+    def load_skill(name: str, tool_context: Any = None) -> dict[str, Any]:
         """Load the on-demand SKILL.md instructions for skill `name`."""
         clean = Path(name).name
         skill_file = staged / "skills" / clean / "SKILL.md"
@@ -460,25 +620,24 @@ def make_workspace_tools(
                 "status": "error",
                 "error": f"skill {name!r} not found; available skills: {available}",
             }
-        sync_workspace_assets(staged, workspace)
+        _ws_for(tool_context)
         return {
             "status": "ok",
             "skill": clean,
             "content": skill_file.read_text(encoding="utf-8", errors="replace"),
         }
 
-    def run_bash(command: str) -> dict[str, Any]:
-        """Execute a bash command in the rollout workspace directory."""
-        sync_workspace_assets(staged, workspace)
+    def _run_bash_sync(command: str, ws: Path) -> dict[str, Any]:
         try:
-            res = subprocess.run(
-                ["bash", "-c", command],
-                cwd=workspace,
-                env=scrub_runtime_env(),
-                capture_output=True,
-                text=True,
-                timeout=effective_timeout,
-            )
+            with _get_subprocess_semaphore():
+                res = subprocess.run(
+                    ["bash", "-c", command],
+                    cwd=ws,
+                    env=scrub_runtime_env(workspace=ws),
+                    capture_output=True,
+                    text=True,
+                    timeout=effective_timeout,
+                )
             return {
                 "status": "ok" if res.returncode == 0 else "error",
                 "exit_code": res.returncode,
@@ -495,10 +654,16 @@ def make_workspace_tools(
         except OSError as exc:
             return {"status": "error", "exit_code": 1, "stdout": "", "stderr": str(exc)}
 
-    def read_file(path: str) -> dict[str, Any]:
+    async def run_bash(command: str, tool_context: Any = None) -> dict[str, Any]:
+        """Execute a bash command asynchronously in the session's workspace directory."""
+        ws = _ws_for(tool_context)
+        return await asyncio.to_thread(_run_bash_sync, command, ws)
+
+    def read_file(path: str, tool_context: Any = None) -> dict[str, Any]:
         """Read a UTF-8 text file from the workspace."""
+        ws = _ws_for(tool_context)
         try:
-            target = _safe_ws_path(path)
+            target = _safe_ws_path(path, ws)
             if not target.is_file():
                 return {"status": "error", "error": f"file not found: {path}"}
             return {
@@ -509,21 +674,24 @@ def make_workspace_tools(
         except (OSError, ValueError) as exc:
             return {"status": "error", "error": str(exc)}
 
-    def write_file(path: str, content: str) -> dict[str, Any]:
+    def write_file(path: str, content: str, tool_context: Any = None) -> dict[str, Any]:
         """Write UTF-8 text `content` to `path` inside the workspace."""
+        ws = _ws_for(tool_context)
         try:
-            target = _safe_ws_path(path)
+            target = _safe_ws_path(path, ws)
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(content, encoding="utf-8")
             return {"status": "ok", "path": path, "bytes_written": len(content.encode("utf-8"))}
         except (OSError, ValueError) as exc:
             return {"status": "error", "error": str(exc)}
 
-    def exit_loop(summary: str, tool_context: Any) -> dict[str, Any]:
+    async def exit_loop(summary: str, tool_context: Any = None) -> dict[str, Any]:
         """Signal that verification passed and escalate out of the ADK LoopAgent."""
-        hook_res = run_hook_event(
+        ws = _ws_for(tool_context)
+        hook_res = await asyncio.to_thread(
+            run_hook_event,
             staged,
-            workspace,
+            ws,
             "Stop",
             tool_name="exit_loop",
             tool_input={"summary": summary},
@@ -534,7 +702,8 @@ def make_workspace_tools(
                 "decision": "block",
                 "reason": hook_res["reason"],
             }
-        tool_context.actions.escalate = True
+        if tool_context is not None and getattr(tool_context, "actions", None) is not None:
+            tool_context.actions.escalate = True
         return {"status": "ok", "escalated": True, "summary": summary}
 
     return {
@@ -547,18 +716,34 @@ def make_workspace_tools(
 
 
 def make_tool_callbacks(
-    staged: Path, workspace: Path
-) -> tuple[Callable[..., dict[str, Any] | None], Callable[..., dict[str, Any] | None]]:
-    """Build ADK `before_tool_callback` and `after_tool_callback` backed by `.adk/hooks.json`."""
+    staged: Path,
+    workspace: Path,
+    *,
+    isolate_sessions: bool | None = None,
+) -> tuple[Callable[..., Any], Callable[..., Any]]:
+    """Build async ADK `before_tool_callback` and `after_tool_callback` backed by `.adk/hooks.json`."""
     staged = Path(staged).resolve()
     workspace = Path(workspace).resolve()
+    effective_isolate = (
+        bool(isolate_sessions)
+        if isolate_sessions is not None
+        else adk_isolate_sessions(default=False)
+    )
 
-    def before_tool_callback(
+    def _ws_for(tool_context: Any = None) -> Path:
+        ws = resolve_session_workspace(
+            workspace, tool_context, isolate_sessions=effective_isolate
+        )
+        ws.mkdir(parents=True, exist_ok=True)
+        return ws
+
+    async def before_tool_callback(
         tool: Any, args: dict[str, Any], tool_context: Any
     ) -> dict[str, Any] | None:
         tname = getattr(tool, "name", str(tool))
-        res = run_hook_event(
-            staged, workspace, "PreToolUse", tool_name=tname, tool_input=args
+        ws = _ws_for(tool_context)
+        res = await asyncio.to_thread(
+            run_hook_event, staged, ws, "PreToolUse", tool_name=tname, tool_input=args
         )
         if res["blocked"]:
             return {
@@ -568,16 +753,18 @@ def make_tool_callbacks(
             }
         return None
 
-    def after_tool_callback(
+    async def after_tool_callback(
         tool: Any,
         args: dict[str, Any],
         tool_context: Any,
         tool_response: dict[str, Any],
     ) -> dict[str, Any] | None:
         tname = getattr(tool, "name", str(tool))
-        res = run_hook_event(
+        ws = _ws_for(tool_context)
+        res = await asyncio.to_thread(
+            run_hook_event,
             staged,
-            workspace,
+            ws,
             "PostToolUse",
             tool_name=tname,
             tool_input=args,
@@ -788,6 +975,7 @@ def build_loop_agent(
     model: str | Any = "",
     max_iterations: int | None = None,
     ctx: Mapping[str, str] | None = None,
+    isolate_sessions: bool | None = None,
 ):
     """Construct the Google ADK `LoopAgent` from a harness directory on disk."""
     adk = load_adk_classes()
@@ -806,8 +994,12 @@ def build_loop_agent(
     max_iters = int(max_iterations if max_iterations is not None else adk_max_iterations())
     global_body = compose_global_instruction(staged, ctx)
 
-    ws_tools = make_workspace_tools(staged, workspace)
-    before_cb, after_cb = make_tool_callbacks(staged, workspace)
+    ws_tools = make_workspace_tools(
+        staged, workspace, isolate_sessions=isolate_sessions
+    )
+    before_cb, after_cb = make_tool_callbacks(
+        staged, workspace, isolate_sessions=isolate_sessions
+    )
 
     solver_override = ""
     verifier_override = ""
@@ -907,6 +1099,7 @@ async def _run_loop_rollout_async(
     model: str | Any = "",
     max_iterations: int | None = None,
     ctx: Mapping[str, str] | None = None,
+    isolate_sessions: bool = False,
 ) -> dict[str, Any]:
     adk = load_adk_classes()
     InMemoryRunner = adk["InMemoryRunner"]
@@ -919,7 +1112,12 @@ async def _run_loop_rollout_async(
 
     run_hook_event(staged, workspace, "SessionStart")
     loop_agent = build_loop_agent(
-        staged, workspace, model=model, max_iterations=max_iterations, ctx=ctx
+        staged,
+        workspace,
+        model=model,
+        max_iterations=max_iterations,
+        ctx=ctx,
+        isolate_sessions=isolate_sessions,
     )
     runner = InMemoryRunner(agent=loop_agent, app_name="loop_agent_runtime")
     session = await runner.session_service.create_session(
@@ -965,6 +1163,7 @@ def run_loop_rollout(
     model: str | Any = "",
     max_iterations: int | None = None,
     ctx: Mapping[str, str] | None = None,
+    isolate_sessions: bool = False,
 ) -> dict[str, Any]:
     """Run one synchronous `LoopAgent` rollout and write its JSONL stream to `events_path`."""
     return asyncio.run(
@@ -976,6 +1175,7 @@ def run_loop_rollout(
             model=model,
             max_iterations=max_iterations,
             ctx=ctx,
+            isolate_sessions=isolate_sessions,
         )
     )
 
@@ -1138,8 +1338,11 @@ __all__ = [
     "DEFAULT_VERIFIER_STAGE_INSTRUCTION",
     "ROOT_DIR",
     "adk_command_timeout",
+    "adk_isolate_sessions",
+    "adk_max_concurrent_commands",
     "adk_max_iterations",
     "adk_model",
+    "adk_session_service_uri",
     "build_loop_agent",
     "compose_global_instruction",
     "load_adk_classes",
@@ -1148,6 +1351,7 @@ __all__ = [
     "make_tool_callbacks",
     "make_workspace_tools",
     "render_events",
+    "resolve_session_workspace",
     "run_hook_event",
     "run_loop_rollout",
     "scrub_runtime_env",

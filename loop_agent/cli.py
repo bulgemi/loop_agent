@@ -18,7 +18,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
+import shutil
+import subprocess
+import sys
 
 from harness2.cli import _common as C
 from harness2.cli import run_sweep as RS
@@ -27,7 +31,7 @@ from harness2.core.proposer import Proposer
 from harness2.demo import DemoAdapter, DemoProposer
 
 from .bridge import make_adk_adapter, wrap_adapter
-from .runtime import load_dotenv
+from .runtime import ROOT_DIR, adk_session_service_uri, load_dotenv
 
 
 def _run_demo(args: argparse.Namespace) -> int:
@@ -101,6 +105,48 @@ def _run_sweep(args: argparse.Namespace) -> int:
     return 2 if failed else 0
 
 
+def _run_serve(args: argparse.Namespace) -> int:
+    adk_bin = shutil.which("adk") or str(Path(sys.executable).parent / "adk")
+    subcmd = "web" if args.web else args.server_mode
+    default_db = ROOT_DIR / "runs" / "adk_interactive" / "sessions.db"
+    default_db.parent.mkdir(parents=True, exist_ok=True)
+    session_uri = (
+        args.session_service_uri
+        or adk_session_service_uri()
+        or f"sqlite:///{default_db.resolve()}"
+    )
+
+    env = dict(os.environ)
+    env["HARNESS2_ADK_ISOLATE_SESSIONS"] = "FALSE" if args.no_isolate_sessions else "TRUE"
+    if args.harness_dir is not None:
+        env["HARNESS2_ADK_HARNESS_DIR"] = str(args.harness_dir.expanduser().resolve())
+    if args.workspace is not None:
+        env["HARNESS2_ADK_WORKSPACE"] = str(args.workspace.expanduser().resolve())
+
+    argv = [
+        adk_bin,
+        subcmd,
+        "--host",
+        args.host,
+        "--port",
+        str(args.port),
+        f"--session_service_uri={session_uri}",
+        str(ROOT_DIR / "loop_agent"),
+    ]
+    if args.dry_run:
+        print(
+            json.dumps(
+                {
+                    "argv": argv,
+                    "isolate_sessions": env["HARNESS2_ADK_ISOLATE_SESSIONS"] == "TRUE",
+                    "session_service_uri": session_uri,
+                }
+            )
+        )
+        return 0
+    return subprocess.call(argv, env=env)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="loop_agent.cli", description=__doc__)
     parser.add_argument(
@@ -130,6 +176,29 @@ def main(argv: list[str] | None = None) -> int:
     p_sweep.add_argument("--max-iterations", type=int, default=None)
     p_sweep.add_argument("--dry-run", action="store_true")
 
+    p_serve = sub.add_parser(
+        "serve",
+        help="Start multi-user ADK Web UI or FastAPI server with per-session isolation & DB storage",
+    )
+    p_serve.add_argument(
+        "--server-mode",
+        choices=("api_server", "web"),
+        default="api_server",
+        help="ADK server mode (`api_server` for REST/SSE or `web` for Web UI)",
+    )
+    p_serve.add_argument("--web", action="store_true", help="Shortcut for `--server-mode web`")
+    p_serve.add_argument("--host", default="127.0.0.1")
+    p_serve.add_argument("--port", type=int, default=8000)
+    p_serve.add_argument(
+        "--session-service-uri",
+        default="",
+        help="Persistent session DB URI (default: sqlite:///runs/adk_interactive/sessions.db)",
+    )
+    p_serve.add_argument("--harness-dir", type=Path, default=None)
+    p_serve.add_argument("--workspace", type=Path, default=None)
+    p_serve.add_argument("--no-isolate-sessions", action="store_true")
+    p_serve.add_argument("--dry-run", action="store_true")
+
     args = parser.parse_args(argv)
     if args.env_file is not None:
         load_dotenv(args.env_file, override=True)
@@ -141,6 +210,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "demo":
         return _run_demo(args)
+    if args.cmd == "serve":
+        return _run_serve(args)
     return _run_sweep(args)
 
 

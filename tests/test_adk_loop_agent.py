@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import json
 import os
 from pathlib import Path
@@ -28,6 +29,7 @@ from unittest.mock import patch
 
 from google.adk.agents import LlmAgent, LoopAgent
 from google.adk.models import BaseLlm, LlmRequest, LlmResponse
+from google.adk.runners import InMemoryRunner
 from google.adk.tools import AgentTool
 from google.genai import types
 
@@ -395,7 +397,7 @@ class AdkLoopAgentTest(unittest.TestCase):
         with patch.dict(os.environ, clean_env, clear=True):
             loaded_example = load_dotenv(example_path, override=True)
             self.assertIn("GOOGLE_API_KEY", loaded_example)
-            self.assertEqual(adk_model(), "gemini-2.5-pro")
+            self.assertEqual(adk_model(), "gemini-3.1-pro-preview")
             self.assertEqual(adk_max_iterations(), 3)
             self.assertEqual(adk_command_timeout(), 120)
 
@@ -410,7 +412,7 @@ class AdkLoopAgentTest(unittest.TestCase):
                 )
                 load_dotenv(custom_env, override=True)
                 self.assertEqual(os.environ.get("GOOGLE_API_KEY"), "test-adk-secret-key")
-                self.assertEqual(os.environ.get("GEMINI_API_KEY"), "test-adk-secret-key")
+                self.assertNotIn("GEMINI_API_KEY", os.environ)
                 self.assertEqual(adk_model(), "gemini-2.5-flash")
                 self.assertEqual(adk_max_iterations(), 5)
                 self.assertEqual(adk_command_timeout(), 45)
@@ -422,7 +424,6 @@ class AdkLoopAgentTest(unittest.TestCase):
 
                 runner_env = AdkSubstrate().run_env()
                 self.assertEqual(runner_env.get("GOOGLE_API_KEY"), "test-adk-secret-key")
-                self.assertEqual(runner_env.get("GEMINI_API_KEY"), "test-adk-secret-key")
 
     def test_adk_agent_loader_discovers_root_loop_agent(self) -> None:
         from google.adk.cli.utils.agent_loader import AgentLoader
@@ -442,6 +443,146 @@ class AdkLoopAgentTest(unittest.TestCase):
                 loaded = loader.load_agent("loop_agent")
                 self.assertIsInstance(loaded, LoopAgent)
                 self.assertEqual([a.name for a in loaded.sub_agents], ["solver", "verifier"])
+
+    def test_concurrent_multi_user_sessions_are_isolated_and_non_blocking(self) -> None:
+        class _MultiUserLlm(BaseLlm):
+            model: str = "test/multi-user-isolated"
+
+            async def generate_content_async(
+                self, llm_request: LlmRequest, stream: bool = False
+            ) -> AsyncGenerator[LlmResponse, None]:
+                sys_inst = str(getattr(llm_request.config, "system_instruction", "") or "")
+                user_text = ""
+                for c in llm_request.contents or ():
+                    if getattr(c, "role", "") == "user":
+                        for p in c.parts or ():
+                            if getattr(p, "text", None):
+                                user_text = str(p.text)
+                last_content = llm_request.contents[-1] if llm_request.contents else None
+                last_parts = (last_content.parts or []) if last_content else []
+                fn_responses = [
+                    p.function_response
+                    for p in last_parts
+                    if getattr(p, "function_response", None) is not None
+                ]
+                is_verifier = "role: verifier" in sys_inst.lower()
+                if not is_verifier:
+                    if not fn_responses:
+                        yield LlmResponse(
+                            content=types.Content(
+                                role="model",
+                                parts=[
+                                    types.Part.from_function_call(
+                                        name="run_bash",
+                                        args={
+                                            "command": f"printf '%s\\n' '{user_text}' > answer.txt && cat answer.txt"
+                                        },
+                                    )
+                                ],
+                            )
+                        )
+                        return
+                    yield LlmResponse(
+                        content=types.Content(
+                            role="model",
+                            parts=[types.Part.from_text(text=f"Wrote {user_text}")],
+                        )
+                    )
+                    return
+
+                if not fn_responses:
+                    yield LlmResponse(
+                        content=types.Content(
+                            role="model",
+                            parts=[
+                                types.Part.from_function_call(
+                                    name="read_file", args={"path": "answer.txt"}
+                                )
+                            ],
+                        )
+                    )
+                    return
+                last_fn = fn_responses[-1]
+                if last_fn.name == "read_file":
+                    resp = last_fn.response if isinstance(last_fn.response, dict) else {}
+                    yield LlmResponse(
+                        content=types.Content(
+                            role="model",
+                            parts=[
+                                types.Part.from_function_call(
+                                    name="exit_loop",
+                                    args={"summary": str(resp.get("content", "")).strip()},
+                                )
+                            ],
+                        )
+                    )
+                    return
+                yield LlmResponse(
+                    content=types.Content(
+                        role="model",
+                        parts=[types.Part.from_text(text="Done")],
+                    )
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            staged = root / "staged"
+            ws = root / "workspace"
+            tree: HT.Tree = {
+                "systemprompt.md": "Multi-user isolated LoopAgent.\n",
+                "guardrails.md": "",
+                "LongTermMEMORY.md": "",
+                "tool_descriptions/tool_guidance.md": "",
+                ".adk/hooks.json": json.dumps(DEMO_STOP_HOOK),
+            }
+            HT.write_tree(ADK_SURFACE, tree, staged)
+
+            loop_agent = build_loop_agent(
+                staged,
+                ws,
+                model=_MultiUserLlm(),
+                max_iterations=2,
+                isolate_sessions=True,
+            )
+            runner = InMemoryRunner(agent=loop_agent, app_name="multi_user_app")
+
+            async def _run_user(uid: str, sid: str, payload: str) -> None:
+                await runner.session_service.create_session(
+                    app_name="multi_user_app", user_id=uid, session_id=sid
+                )
+                msg = types.Content(role="user", parts=[types.Part.from_text(text=payload)])
+                async for _ in runner.run_async(user_id=uid, session_id=sid, new_message=msg):
+                    pass
+
+            async def _run_all() -> None:
+                await asyncio.gather(
+                    _run_user("alice", "sess_1", "Total: 111.11"),
+                    _run_user("bob", "sess_2", "Total: 222.22"),
+                )
+
+            asyncio.run(_run_all())
+
+            alice_ans = ws / "alice" / "sess_1" / "answer.txt"
+            bob_ans = ws / "bob" / "sess_2" / "answer.txt"
+            self.assertEqual(alice_ans.read_text(encoding="utf-8").strip(), "Total: 111.11")
+            self.assertEqual(bob_ans.read_text(encoding="utf-8").strip(), "Total: 222.22")
+            self.assertTrue((ws / "alice" / "sess_1" / ".tmp").is_dir())
+            self.assertTrue((ws / "bob" / "sess_2" / ".tmp").is_dir())
+
+            ws_tools = make_workspace_tools(staged, ws, isolate_sessions=True)
+            fake_alice_ctx = type(
+                "_Ctx",
+                (),
+                {"user_id": "alice", "session": type("_S", (), {"id": "sess_1"})()},
+            )()
+            escape_res = ws_tools["read_file"](
+                "../../bob/sess_2/answer.txt", tool_context=fake_alice_ctx
+            )
+            self.assertEqual(escape_res["status"], "error")
+            self.assertIn("outside workspace", escape_res["error"])
+
+            rc = loop_cli_main(["serve", "--web", "--port", "8123", "--dry-run"])
+            self.assertEqual(rc, 0)
 
 
 if __name__ == "__main__":
