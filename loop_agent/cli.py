@@ -105,6 +105,31 @@ def _run_sweep(args: argparse.Namespace) -> int:
     return 2 if failed else 0
 
 
+def _ensure_telemetry_consent() -> None:
+    try:
+        from google.adk.utils import _telemetry_config
+
+        if _telemetry_config.read_telemetry_consent() is None:
+            _telemetry_config.write_telemetry_consent(False)
+    except Exception:
+        pass
+
+
+def _invoke_adk_cli(adk_args: list[str], env: dict[str, str]) -> int:
+    os.environ.update(env)
+    _ensure_telemetry_consent()
+    try:
+        from google.adk.cli import main as adk_main
+
+        rc = adk_main(args=adk_args, prog_name="adk", standalone_mode=False)
+        return int(rc) if isinstance(rc, int) else 0
+    except SystemExit as exc:
+        return int(exc.code) if isinstance(exc.code, int) else 0
+    except ImportError:
+        adk_bin = shutil.which("adk") or str(Path(sys.executable).parent / "adk")
+        return subprocess.call([adk_bin, *adk_args], env=env)
+
+
 def _run_serve(args: argparse.Namespace) -> int:
     adk_bin = shutil.which("adk") or str(Path(sys.executable).parent / "adk")
     subcmd = "web" if args.web else args.server_mode
@@ -123,16 +148,20 @@ def _run_serve(args: argparse.Namespace) -> int:
     if args.workspace is not None:
         env["HARNESS2_ADK_WORKSPACE"] = str(args.workspace.expanduser().resolve())
 
-    argv = [
-        adk_bin,
+    adk_args = [
         subcmd,
         "--host",
         args.host,
         "--port",
         str(args.port),
+        "--reload" if args.reload else "--no-reload",
         f"--session_service_uri={session_uri}",
-        str(ROOT_DIR / "loop_agent"),
     ]
+    if args.reload_agents:
+        adk_args.append("--reload_agents")
+    adk_args.append(str(ROOT_DIR / "loop_agent"))
+
+    argv = [adk_bin, *adk_args]
     if args.dry_run:
         print(
             json.dumps(
@@ -144,7 +173,34 @@ def _run_serve(args: argparse.Namespace) -> int:
             )
         )
         return 0
-    return subprocess.call(argv, env=env)
+    return _invoke_adk_cli(adk_args, env)
+
+
+def _run_interactive(args: argparse.Namespace) -> int:
+    adk_bin = shutil.which("adk") or str(Path(sys.executable).parent / "adk")
+    env = dict(os.environ)
+    env["HARNESS2_ADK_ISOLATE_SESSIONS"] = "FALSE" if args.no_isolate_sessions else "TRUE"
+    if args.harness_dir is not None:
+        env["HARNESS2_ADK_HARNESS_DIR"] = str(args.harness_dir.expanduser().resolve())
+    if args.workspace is not None:
+        env["HARNESS2_ADK_WORKSPACE"] = str(args.workspace.expanduser().resolve())
+
+    adk_args = ["run"]
+    if args.save_session:
+        adk_args.append("--save_session")
+    adk_args.append(str(ROOT_DIR / "loop_agent"))
+    argv = [adk_bin, *adk_args]
+    if args.dry_run:
+        print(
+            json.dumps(
+                {
+                    "argv": argv,
+                    "isolate_sessions": env["HARNESS2_ADK_ISOLATE_SESSIONS"] == "TRUE",
+                }
+            )
+        )
+        return 0
+    return _invoke_adk_cli(adk_args, env)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -197,7 +253,23 @@ def main(argv: list[str] | None = None) -> int:
     p_serve.add_argument("--harness-dir", type=Path, default=None)
     p_serve.add_argument("--workspace", type=Path, default=None)
     p_serve.add_argument("--no-isolate-sessions", action="store_true")
+    p_serve.add_argument("--reload", action="store_true", help="Enable uvicorn reload")
+    p_serve.add_argument(
+        "--reload-agents",
+        action="store_true",
+        help="Live-reload agent definitions on file change",
+    )
     p_serve.add_argument("--dry-run", action="store_true")
+
+    p_run = sub.add_parser(
+        "run",
+        help="Start an interactive terminal chat session (`adk run`) in-process",
+    )
+    p_run.add_argument("--harness-dir", type=Path, default=None)
+    p_run.add_argument("--workspace", type=Path, default=None)
+    p_run.add_argument("--no-isolate-sessions", action="store_true")
+    p_run.add_argument("--save-session", action="store_true")
+    p_run.add_argument("--dry-run", action="store_true")
 
     args = parser.parse_args(argv)
     if args.env_file is not None:
@@ -212,6 +284,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_demo(args)
     if args.cmd == "serve":
         return _run_serve(args)
+    if args.cmd == "run":
+        return _run_interactive(args)
     return _run_sweep(args)
 
 

@@ -259,7 +259,20 @@ curl -X POST http://127.0.0.1:8000/run \
   }'
 ```
 
-### 4.6 Python API로 사용하기
+### 4.6 VS Code `Run and Debug` (`F5`)로 기동 및 디버깅하기
+
+프로젝트 루트의 `.vscode/launch.json`에 VS Code **Run and Debug** 프로파일 6종이 구성되어 있습니다. `loop_agent.cli`가 ADK 서버/러너를 자식 프로세스가 아닌 **동일 프로세스(In-Process)** 로 기동하므로, `loop_agent/runtime.py`, `loop_agent/agent.py`, `loop_agent/bridge.py` 내부 어디에 중단점(Breakpoint)을 걸어도 즉시 적중합니다.
+
+| 디버그 구성 이름 | 실행 동작 |
+|---|---|
+| `LoopAgent: ADK Web UI (Port 8000)` | `http://127.0.0.1:8000`에서 대화형 Web UI 기동 (`--reload-agents`, 세션 격리, SQLite 세션 저장소 활성화) |
+| `LoopAgent: ADK API Server (REST/SSE, Port 8000)` | `http://127.0.0.1:8000`에서 FastAPI REST/SSE 서버 기동 (`/docs` Swagger UI 포함) |
+| `LoopAgent: Terminal Chat (adk run)` | VS Code 통합 터미널에서 대화형 CLI 채팅(`adk run`) 기동 |
+| `LoopAgent: Offline Adaptation Demo (k=1)` | `runs/demo_adk`에 오프라인 적응 루프 데모 실행 및 디버깅 |
+| `LoopAgent: Benchmark Sweep (Dry Run)` | 벤치마크 스윕(`jb`, `k=1`) 태스크/도메인 스케줄링 Dry-Run 디버깅 |
+| `LoopAgent: Unit Tests` | `tests/test_adk_loop_agent.py` 전체 단위 테스트 디버깅 |
+
+### 4.7 Python API로 사용하기
 
 ```python
 from pathlib import Path

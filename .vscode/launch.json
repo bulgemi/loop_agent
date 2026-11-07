@@ -1,0 +1,114 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "LoopAgent: ADK Web UI (Port 8000)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "loop_agent.cli",
+      "args": [
+        "serve",
+        "--web",
+        "--port",
+        "8000",
+        "--reload-agents"
+      ],
+      "cwd": "${workspaceFolder}",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "envFile": "${workspaceFolder}/.env",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
+      "name": "LoopAgent: ADK API Server (REST/SSE, Port 8000)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "loop_agent.cli",
+      "args": [
+        "serve",
+        "--server-mode",
+        "api_server",
+        "--port",
+        "8000",
+        "--reload-agents"
+      ],
+      "cwd": "${workspaceFolder}",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "envFile": "${workspaceFolder}/.env",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
+      "name": "LoopAgent: Terminal Chat (adk run)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "loop_agent.cli",
+      "args": [
+        "run"
+      ],
+      "cwd": "${workspaceFolder}",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "envFile": "${workspaceFolder}/.env",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
+      "name": "LoopAgent: Offline Adaptation Demo (k=1)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "loop_agent.cli",
+      "args": [
+        "demo",
+        "--output",
+        "${workspaceFolder}/runs/demo_adk",
+        "--k",
+        "1",
+        "--mode",
+        "both"
+      ],
+      "cwd": "${workspaceFolder}",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "envFile": "${workspaceFolder}/.env",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
+      "name": "LoopAgent: Benchmark Sweep (Dry Run)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "loop_agent.cli",
+      "args": [
+        "sweep",
+        "--bench",
+        "jb",
+        "--k",
+        "1",
+        "--dry-run"
+      ],
+      "cwd": "${workspaceFolder}",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "envFile": "${workspaceFolder}/.env",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
+      "name": "LoopAgent: Unit Tests",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "unittest",
+      "args": [
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_adk_loop_agent.py",
+        "-v"
+      ],
+      "cwd": "${workspaceFolder}",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "envFile": "${workspaceFolder}/.env",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    }
+  ]
+}

@@ -583,6 +583,27 @@ class AdkLoopAgentTest(unittest.TestCase):
 
             rc = loop_cli_main(["serve", "--web", "--port", "8123", "--dry-run"])
             self.assertEqual(rc, 0)
+            rc_run = loop_cli_main(["run", "--dry-run"])
+            self.assertEqual(rc_run, 0)
+
+    def test_vscode_launch_json_configurations_are_valid(self) -> None:
+        launch_path = REPO_ROOT / ".vscode" / "launch.json"
+        self.assertTrue(launch_path.is_file(), ".vscode/launch.json must exist")
+        data = json.loads(launch_path.read_text(encoding="utf-8"))
+        self.assertEqual(data.get("version"), "0.2.0")
+        configs = data.get("configurations", [])
+        self.assertGreaterEqual(len(configs), 5)
+        names = {c.get("name") for c in configs}
+        self.assertIn("LoopAgent: ADK Web UI (Port 8000)", names)
+        self.assertIn("LoopAgent: ADK API Server (REST/SSE, Port 8000)", names)
+        self.assertIn("LoopAgent: Terminal Chat (adk run)", names)
+        self.assertIn("LoopAgent: Offline Adaptation Demo (k=1)", names)
+        self.assertIn("LoopAgent: Unit Tests", names)
+        for cfg in configs:
+            self.assertEqual(cfg.get("type"), "debugpy")
+            self.assertEqual(cfg.get("request"), "launch")
+            self.assertEqual(cfg.get("python"), "${workspaceFolder}/.venv/bin/python")
+            self.assertEqual(cfg.get("envFile"), "${workspaceFolder}/.env")
 
 
 if __name__ == "__main__":
